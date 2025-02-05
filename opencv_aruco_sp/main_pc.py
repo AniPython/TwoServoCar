@@ -1,11 +1,17 @@
+"""
+发送 json 格式数据
+{
+    "left_speed": int,
+    "right_speed": int,
+}
+来控制小车运动
+"""
+
 import cv2
 import numpy as np
 import json
 import socket
 import math
-
-import time
-
 
 # 初始化摄像头
 cap = cv2.VideoCapture(0)
