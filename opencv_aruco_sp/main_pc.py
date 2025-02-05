@@ -1,130 +1,127 @@
 import cv2
 import numpy as np
-import socket
 import json
+import socket
+import math
 
-from consts import *
+import time
 
-is_sendto_esp32 = True
-sock_udp = None
-image_show = None
-car_center = (0, 0)
 
-def get_corner_edge_length(corner: np.typing.ArrayLike) -> float:
+# 初始化摄像头
+cap = cv2.VideoCapture(0)
+
+# 设置 ArUco 字典和参数
+aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
+parameters = cv2.aruco.DetectorParameters()
+detector= cv2.aruco.ArucoDetector(aruco_dict, parameters)
+
+# 创建 UDP 客户端
+esp32_ip = "192.168.2.180"  # ESP32 的 IP 地址
+esp32_port = 12345  # ESP32 接收端口
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+CAR_ARUCO_ID = 3
+CTRL_ARUCO_ID = 0
+
+
+k_rad = 12
+k_speed = 0.08
+
+# 计算左右轮速度
+def calculate_wheel_speeds(radian, speed):
+    max_speed = 35  # 最大速度
+    left_speed = max(min(speed - radian, max_speed), -max_speed)
+    right_speed = max(min(speed + radian, max_speed), -max_speed)
+    return left_speed, right_speed
+
+
+def calculate_corner_radian(corner):
     corner = corner.squeeze()
-    return np.sqrt(np.square(corner[0][0] - corner[1][0]) + np.square(corner[0][1] - corner[1][1]))
+    corner_radian = math.atan2(corner[1, 1] - corner[0, 1], corner[1, 0] - corner[0, 0])
+    return corner_radian
 
+def calculate_2corner_radian_diff(corner1, corner2):
+    corner1 = corner1.squeeze()
+    corner2 = corner2.squeeze()
 
-def update_k(car_corner: np.typing.ArrayLike):
-    global k
-    # 获取 car_corner 的边长
-    edge_length = get_corner_edge_length(car_corner)
-    # print("edge_length_px: ", edge_length)
-    k = edge_length / CAR_ARUCO_SIZE_MM
+    vector1 = corner1[0] - corner1[1]
+    vector2 = corner2[0] - corner2[1]
+    corner_radian_diff =  np.arctan2(vector1[1], vector1[0]) - np.arctan2(vector2[1], vector2[0])
+    return corner_radian_diff
 
-def default_4x4_aruco_detector():
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
-    detector_params = cv2.aruco.DetectorParameters()
-    return cv2.aruco.ArucoDetector(dictionary, detector_params)
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
 
+    WIDTH, HEIGHT = frame.shape[1], frame.shape[0]
 
-def aruco_detect(detector, image: np.typing.ArrayLike, is_show=False):
-    # 将 BGR 图像转换为灰度图像
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # 如果噪声明显，用中值滤波去噪
-    image = cv2.medianBlur(image, 5)
-    # 使用高斯模糊进一步平滑图像
-    image = cv2.GaussianBlur(image, (5, 5), 0)
-    # 使用 Otsu 阈值法进行二值化（更适合光照不均匀的场景）
-    ret, image = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # 检测 ArUco 标记
+    # corners, ids, _ = cv2.aruco.detectMarkers(frame, aruco_dict, parameters=parameters)
+    # corners, ids = aruco_detect(aruco_detector, image, is_show=True)
 
-    # 使用检测器检测图像中的ARuco标记
-    corners, ids, _ = detector.detectMarkers(image)
-    if is_show:
-        cv2.aruco.drawDetectedMarkers(image, corners, ids)
-        cv2.imshow("blur out", image)
-        key = cv2.waitKey(1)
-        if key == 27:  # esc 键退出
-            cv2.destroyAllWindows()
-    return corners, ids
+    corners, ids, _ = detector.detectMarkers(frame)
 
+    control_data = {
+        "left_speed": 0,
+        "right_speed": 0
+    }
 
-def main():
-    global sock_udp, image_show, WIDTH, HEIGHT, status, car_center
+    if ids is not None and len(ids) == 2 and  CAR_ARUCO_ID in ids and CTRL_ARUCO_ID in ids:
+        for i, corner in zip(ids.flatten(), corners):
+            # 识别小车 ArUco（编号为0）和遥控器 ArUco（其他编号）
+            if i == CAR_ARUCO_ID:  # 小车的 ArUco（编号为0）
+                car_corners = corner
+                car_center = np.mean(car_corners, axis=1).flatten()
+                car_radian = calculate_corner_radian(car_corners)
+                # print(f"car_radian: {car_radian}")
+                cv2.circle(frame, tuple(car_center.astype(int)), 5, (0, 0, 255), -1)
+            if i == CTRL_ARUCO_ID:  # 遥控器的 ArUco
+                remote_corners = corner
+                remote_center = np.mean(remote_corners, axis=1).flatten()
+                remote_radian = calculate_corner_radian(remote_corners)
+                # print(f"remote_radian: {remote_radian}")
+                cv2.circle(frame, tuple(remote_center.astype(int)), 5, (0, 255, 0), -1)
 
-    if is_sendto_esp32:
-        sock_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # 计算遥控器的角度（屏幕水平与垂直方向）
+        # radian_diff = car_radian - remote_radian
+        speed = remote_center[1] - HEIGHT / 2  # 用遥控器垂直方向的位置来控制速度
 
-    # 创建ArUco探测器对象
-    aruco_detector = default_4x4_aruco_detector()
+        radian_diff = calculate_2corner_radian_diff(car_corners, remote_corners)
+        if radian_diff > math.pi:
+            radian_diff -= 2 * math.pi
+        elif radian_diff < -math.pi:
+            radian_diff += 2 * math.pi
+        # print(f"radian_diff: {radian_diff}")
 
-    input_video = cv2.VideoCapture(CAM_ID)
+        # print(f"Angle: {angle}, Speed: {speed}")
+        # time.sleep(0.8)
 
-    while input_video.grab():
-        ret, image = input_video.retrieve()
-        if not ret:
-            continue
+        # 计算左右轮速度
+        left_speed, right_speed = calculate_wheel_speeds(radian_diff * k_rad, speed * k_speed)
 
-        if not WIDTH or not HEIGHT:
-            WIDTH, HEIGHT = image.shape[1], image.shape[0]
+        # 发送数据到 ESP32
+        control_data = {
+            "left_speed": int(left_speed),
+            "right_speed": int(right_speed)
+        }
 
-        # 复制图像用于绘制结果
-        image_show = image.copy()
+    try:
+        sock.sendto(json.dumps(control_data).encode(), (esp32_ip, esp32_port))
+    except OSError as e:
+        pass
+        # print(f"Error sending data to ESP32: {e}")
 
-        # 检测标记并获取相关信息
-        corners, ids = aruco_detect(aruco_detector, image, is_show=True)
+    # print(control_data)
+    # time.sleep(0.2)
 
-        if ids is None:
-            status = 0
-            send_data = {
-                "angle": 0,
-                "distance": 0,
-                "status": status
-            }
-        elif len(ids) == 2 and CAR_ARUCO_ID in ids and CTRL_ARUCO_ID in ids:
-            status = 1
-            # corners = corners[0]
-            # ids = ids.flatten()
-            # assert len(np.where(ids.flatten() == CAR_ARUCO_ID)[0]) < 2, f"CAR_ARUCO_ID: {CAR_ARUCO_ID} 最多只能出现1个"
-            # print("ids:", ids)
+    # 显示处理后的图像
+    cv2.imshow('Frame', frame)
 
-            # 在图像上绘制检测到的标记
-            cv2.aruco.drawDetectedMarkers(image_show, corners, ids)
+    # 按键 'q' 退出
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
-            # print("===================")
-            car_aruco_index = np.where(ids == CAR_ARUCO_ID)[0][0]
-            car_corner = corners[int(car_aruco_index)]
-            update_k(car_corner)
-
-            send_data = {
-                "left_speed": 0,
-                "right_speed": 0,
-                "status": 1
-            }
-
-            # print(send_data)
-
-        else:
-            status = 0
-            send_data = {
-                "angle": 0,
-                "distance": 0,
-                "status": status
-            }
-
-        json_data = json.dumps(send_data).encode()
-        # print(json_data)
-        try:
-            if is_sendto_esp32 and ESP32_IP is not None and ESP32_PORT is not None:
-                sock_udp.sendto(json_data, (ESP32_IP, ESP32_PORT))
-        except OSError:
-            pass
-
-        cv2.imshow("out", image_show)
-        # cv2.imshow("out_temp", image_circle)
-        key = cv2.waitKey(1)
-        if key == 27:  # esc 键退出
-            break
-
-    input_video.release()
-    cv2.destroyAllWindows()
+cap.release()
+cv2.destroyAllWindows()
+sock.close()
